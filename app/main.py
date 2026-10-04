@@ -379,10 +379,16 @@ def create_retouch(payload: dict | None = None):
             cached = json.loads(report_path.read_text("utf-8"))
         except (json.JSONDecodeError, OSError):
             cached = None
-        # 命中缓存必须核对报告、预览与成品同本次任务、矩形及约束的绑定；
-        # 不符（或报告不可读）时拒绝复用，落入下方按本次请求重新计算。
+        # 命中缓存必须**重算并逐字节核对**报告、预览与成品同本次任务、矩形、
+        # 约束、原任务 CMYK 起点及 ICC 的绑定（含靠边缘裁剪后的实际选区）；
+        # 仅指纹/任务 ID/文件存在不足以信任。任一不符即拒绝复用，落入下方
+        # 按本次请求重新搜索并覆盖报告与产物。
         if cached is not None and rt.cache_entry_valid(
-            cached, retouch_id, fingerprint, base
+            cached, retouch_id, fingerprint, base,
+            meta=meta, req=req, cmyk_full=ctx["cmyk"],
+            press_bytes=press_bytes, display_bytes=display_bytes,
+            press_summary=press_summary_full,
+            display_summary=display_summary_full,
         ):
             report = cached
     if report is None:

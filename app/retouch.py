@@ -178,6 +178,19 @@ def _feasible_offsets(roi: np.ndarray, max_shift: int, tac_limit: int) -> np.nda
     return candidates[keep]
 
 
+def _quad_keys(cmyk: np.ndarray) -> np.ndarray:
+    """把 (..., 4) uint8 CMYK 数组编码为 (...,) uint64 四元组键。"""
+    c = cmyk.astype(np.uint64)
+    return c[..., 0] | (c[..., 1] << 8) | (c[..., 2] << 16) | (c[..., 3] << 24)
+
+
+def _keys_to_quads(keys: np.ndarray) -> np.ndarray:
+    k = keys.astype(np.uint64)
+    return np.stack(
+        (k & 255, (k >> 8) & 255, (k >> 16) & 255, (k >> 24) & 255), axis=-1
+    ).astype(np.uint8)
+
+
 def _mean_lab_for_offset(
     flat_cmyk: np.ndarray,
     offset: np.ndarray,
@@ -194,12 +207,7 @@ def _mean_lab_for_offset(
         flat_cmyk.astype(np.int32) + offset[None, :].astype(np.int32), 0, 255
     ).astype(np.uint8)
 
-    keys = (
-        shifted[:, 0].astype(np.uint64)
-        | (shifted[:, 1].astype(np.uint64) << 8)
-        | (shifted[:, 2].astype(np.uint64) << 16)
-        | (shifted[:, 3].astype(np.uint64) << 24)
-    )
+    keys = _quad_keys(shifted)
     unique_keys, inverse, counts = np.unique(
         keys, return_inverse=True, return_counts=True
     )
@@ -219,6 +227,82 @@ def _mean_lab_for_offset(
     unique_lab = np.stack([lab_cache[k] for k in key_list])
     weights = (counts.astype(np.float64) / counts.sum())[:, None]
     return (unique_lab * weights).sum(axis=0)
+
+
+# 分块向量化评估时，单块“候选数 × 选区内不同 CMYK 四元组数”的工作集上限。
+# 取 ~2^19：典型情形内存占用为几十 MB，3000px 上限下 64×64 选区也安全。
+_EVAL_CHUNK_CELLS = 1 << 19
+# 全局四元组→Lab 缓存的条数上限（紧凑 ndarray 存储，每条 16 字节）；
+# 命中即直接复用，超出上限后丢弃重建——缓存仅是可选记忆化，不影响结果，
+# 保证即便选区内不同 CMYK 四元组极多也不会让 Python dict 无限膨胀。
+_EVAL_CACHE_CAP = 400_000
+
+
+def evaluate_candidate_mean_labs(
+    flat_cmyk: np.ndarray,
+    candidates: np.ndarray,
+    lab_xf,
+) -> np.ndarray:
+    """一次性向量化评估所有候选偏移的**像素加权平均 Lab**。
+
+    与逐个候选调用 :func:`_mean_lab_for_offset` 结果完全一致（同样的裁剪、
+    同样的四元组去重、同样的 LittleCMS TYPE_Lab_DBL 回算），但以分块批量
+    方式让 LittleCMS 成组转换，避免 17^4 量级候选时的逐次调用开销。
+    """
+    n_cand = candidates.shape[0]
+    mean_labs = np.empty((n_cand, 3), dtype=np.float64)
+    if n_cand == 0:
+        return mean_labs
+
+    # 选区内原始不同 CMYK 四元组及其像素占比（均值即占比加权和）。
+    base_keys, counts = np.unique(_quad_keys(flat_cmyk), return_counts=True)
+    base_quads = _keys_to_quads(base_keys).astype(np.int32)
+    weights = (counts.astype(np.float64) / counts.sum())[None, :, None]
+    n_quads = base_quads.shape[0]
+
+    # 紧凑缓存：键与 Lab 各存一个 ndarray（无逐条 Python 对象开销）。
+    cache_keys = np.empty(0, dtype=np.uint64)
+    cache_labs = np.empty((0, 3), dtype=np.float64)
+
+    chunk = max(1, _EVAL_CHUNK_CELLS // max(1, n_quads))
+    for start in range(0, n_cand, chunk):
+        offs = candidates[start:start + chunk].astype(np.int32)
+        shifted = np.clip(
+            base_quads[None, :, :] + offs[:, None, :], 0, 255
+        ).astype(np.uint8)
+        keys = _quad_keys(shifted)
+        block_unique = np.unique(keys)
+
+        # 与缓存求差集：仅未命中的四元组交给 LittleCMS 回算。
+        if cache_keys.size:
+            hit_idx = np.searchsorted(cache_keys, block_unique)
+            hit_idx = np.clip(hit_idx, 0, cache_keys.size - 1)
+            is_hit = cache_keys[hit_idx] == block_unique
+            missing = block_unique[~is_hit]
+        else:
+            is_hit = np.zeros_like(block_unique, dtype=bool)
+            missing = block_unique
+
+        if missing.size:
+            new_labs = lab_xf(np.ascontiguousarray(_keys_to_quads(missing)))
+            if cache_keys.size + missing.size > _EVAL_CACHE_CAP:
+                # 超上限：只保留本块用到的四元组（丢弃旧缓存，不影响正确性）。
+                cache_keys = block_unique
+                cache_labs = lab_xf(
+                    np.ascontiguousarray(_keys_to_quads(block_unique)))
+            else:
+                cache_keys = np.concatenate([cache_keys, missing])
+                order = np.argsort(cache_keys)
+                cache_keys = cache_keys[order]
+                cache_labs = np.concatenate([cache_labs, new_labs])[order]
+
+        # 一次 searchsorted 取回本块全部键对应的 Lab，再按像素占比加权。
+        flat_idx = np.clip(
+            np.searchsorted(cache_keys, keys.ravel()), 0, cache_keys.size - 1)
+        flat_lab = cache_labs[flat_idx]
+        gathered = flat_lab.reshape(keys.shape[0], n_quads, 3)
+        mean_labs[start:start + offs.shape[0]] = (gathered * weights).sum(axis=1)
+    return mean_labs
 
 
 def run_retouch(req: RetouchRequest, ctx: dict, press_bytes: bytes) -> dict:
@@ -246,18 +330,18 @@ def run_retouch(req: RetouchRequest, ctx: dict, press_bytes: bytes) -> dict:
         de_before_target = float(colorscience.ciede2000(
             target[None, None, :], baseline_mean_lab[None, None, :])[0, 0])
 
-        lab_cache: dict[int, np.ndarray] = {}
-        mean_labs = np.empty((candidates.shape[0], 3), dtype=np.float64)
-        for gi, off in enumerate(candidates):
-            mean_labs[gi] = _mean_lab_for_offset(flat, off, lab_xf, lab_cache)
+        n_cand = candidates.shape[0]
+        mean_labs = evaluate_candidate_mean_labs(flat, candidates, lab_xf)
 
         # 一次性向量化计算全部候选对目标的 ΔE00（colorscience 与主流水线相同）。
-        n_cand = candidates.shape[0]
-        targets = np.repeat(target[None, :], n_cand, axis=0)
-        de_all = colorscience.ciede2000(
-            targets.reshape(n_cand, 1, 3),
-            mean_labs.reshape(n_cand, 1, 3),
-        ).reshape(n_cand)
+        if n_cand:
+            targets = np.repeat(target[None, :], n_cand, axis=0)
+            de_all = colorscience.ciede2000(
+                targets.reshape(n_cand, 1, 3),
+                mean_labs.reshape(n_cand, 1, 3),
+            ).reshape(n_cand)
+        else:
+            de_all = np.empty(0, dtype=np.float64)
 
         abs_sums = np.abs(candidates.astype(np.int32)).sum(axis=1)
         # 1) ΔE00 升序 2) 偏移绝对值和升序 3) (C,M,Y,K) 字典序；
@@ -426,35 +510,203 @@ def compute_retouch_id(meta: dict, req: RetouchRequest) -> str:
     ).hexdigest()
 
 
-def cache_entry_valid(report: object, retouch_id: str, fingerprint: dict,
-                      base: Path) -> bool:
-    """命中缓存时核对报告与产物确实绑定本次任务、矩形及约束。
+def _reports_equivalent(a: object, b: object, *, _tol: float = 1e-9) -> bool:
+    """结构相同即视为一致；浮点数按 ``_tol`` 容差比较（None 严格区分）。"""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return a is b
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return abs(float(a) - float(b)) <= _tol
+    if isinstance(a, str) or isinstance(b, str) or a is None or b is None:
+        return a == b
+    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+        return len(a) == len(b) and all(
+            _reports_equivalent(x, y, _tol=_tol) for x, y in zip(a, b))
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(
+            _reports_equivalent(a[k], b[k], _tol=_tol) for k in a)
+    return a == b
 
-    任一不符即拒绝复用（调用方按本次请求重新计算并覆盖）：
 
-    * 报告须记录同一 ``retouch_id`` 与**完全一致的请求指纹**（任务、选区
-      矩形、目标 Lab、容差、偏移/总墨量约束逐项相等）；
-    * 报告须绑定同一原任务；
-    * 修色前/后预览 PNG 必须都在；
-    * 可达时成品 TIFF 必须在；不可达时不得残留成品 TIFF。
+def _expected_rect(meta: dict, req: RetouchRequest) -> dict:
+    """本次请求在实际图像尺寸上裁剪后的真实选区（靠边缘时按实际选区核对）。"""
+    H = int(meta.get("height", 0))
+    W = int(meta.get("width", 0))
+    x2, y2 = min(W, req.x + req.width), min(H, req.y + req.height)
+    return {"x": int(req.x), "y": int(req.y),
+            "width": int(x2 - req.x), "height": int(y2 - req.y)}
+
+
+def _check_cached_structure(
+    report: object,
+    retouch_id: str,
+    fingerprint: dict,
+    meta: dict,
+    req: RetouchRequest,
+    press_summary: dict,
+    display_summary: dict,
+) -> bool:
+    """不依赖重算的结构性绑定核对。
+
+    逐项确认缓存报告里记录的实际选区、约束、原任务与 ICC 摘要确实对应当前
+    请求（而不是只凭目录名/指纹文本/文件是否存在就复用）。任一项不符即
+    拒绝复用。
     """
     if not isinstance(report, dict):
         return False
     if report.get("retouch_id") != retouch_id:
         return False
+    # 完整请求指纹必须逐项相等（任务、意图、矩形、目标 Lab、容差、两类约束）。
     if report.get("request") != fingerprint:
         return False
+
+    expected_rect = _expected_rect(meta, req)
+    if report.get("region") != expected_rect:
+        return False
+    if report.get("pixel_count") != expected_rect["width"] * expected_rect["height"]:
+        return False
+
+    # 报告里另存的约束块必须是本次请求实际生效的约束（防止只改报告字段的
+    # 脏缓存：request 不变但 constraints/region 被改写）。
+    constraints = report.get("constraints")
+    if not isinstance(constraints, dict):
+        return False
+
+    def _is_real_num(v) -> bool:
+        return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+    cached_target = constraints.get("target_lab")
+    if not isinstance(cached_target, list) or len(cached_target) != 3 \
+            or not all(_is_real_num(v) for v in cached_target) \
+            or any(abs(float(a) - float(b)) > 1e-9
+                   for a, b in zip(cached_target, req.target_lab)):
+        return False
+    cached_tol = constraints.get("tolerance_de00")
+    if not _is_real_num(cached_tol) or float(cached_tol) < 0.0 \
+            or abs(float(cached_tol) - float(req.tolerance_de)) > 1e-9:
+        return False
+    if constraints.get("max_shift_per_channel") != int(req.max_shift) \
+            or constraints.get("total_ink_limit") != int(req.tac_limit):
+        return False
+
+    # 原任务绑定：job_id、原图哈希、尺寸、模式、意图、阈值都必须与当前任务
+    # 的 meta 一致（同 ID 目录被另一份有效任务数据替换时由此检出）。
     source_job = report.get("source_job")
-    if not isinstance(source_job, dict) or \
-            source_job.get("job_id") != fingerprint["job_id"]:
+    if not isinstance(source_job, dict):
         return False
-    if not (base / "before.png").is_file() or \
-            not (base / "after.png").is_file():
+    expected_job = {
+        "job_id": meta.get("job_id"),
+        "image_sha256": meta.get("image_sha256"),
+        "width": meta.get("width"),
+        "height": meta.get("height"),
+        "image_mode": meta.get("mode"),
+        "source_intent": meta.get("source_intent"),
+        "proof_intent": meta.get("proof_intent"),
+        "threshold_delta_e": meta.get("threshold"),
+    }
+    if any(source_job.get(k) != v for k, v in expected_job.items()):
         return False
-    tiff = base / "retouched.tif"
+
+    # ICC 摘要：修色报告必须绑定当前任务实际使用的印刷/显示 ICC 全摘要
+    # （至少全 64 位 SHA-256 必须一致；调用方已在读取时校验过摘要）。
+    profiles = report.get("profiles")
+    if not isinstance(profiles, dict):
+        return False
+    for role, summary in (("press", press_summary), ("display", display_summary)):
+        cached_summary = profiles.get(role)
+        if not isinstance(cached_summary, dict):
+            return False
+        if cached_summary.get("sha256") != summary.get("sha256"):
+            return False
+
+    # reachable 与偏移字段必须自洽。
+    if report.get("reachable") not in (True, False):
+        return False
+    off = report.get("best_offset_cmyk")
+    if not isinstance(off, list) or len(off) != 4 \
+            or not all(isinstance(v, int) and not isinstance(v, bool) for v in off):
+        return False
     if report.get("reachable") is True:
-        return tiff.is_file()
-    return not tiff.exists()
+        if any(abs(v) > int(req.max_shift) for v in off):
+            return False
+        if report.get("best_abs_shift_sum") != sum(abs(v) for v in off):
+            return False
+        if not isinstance(report.get("residual"), dict) \
+                or report["residual"].get("mean_lab_after") is None:
+            return False
+    artifacts = report.get("artifacts")
+    if not isinstance(artifacts, dict):
+        return False
+    if bool(artifacts.get("tiff")) is not bool(report.get("reachable")):
+        return False
+    return True
+
+
+def cache_entry_valid(report: object, retouch_id: str, fingerprint: dict,
+                      base: Path, *, meta: dict, req: RetouchRequest,
+                      cmyk_full: np.ndarray, press_bytes: bytes,
+                      display_bytes: bytes,
+                      press_summary: dict, display_summary: dict) -> bool:
+    """命中缓存时完整核对报告、预览与成品与本次请求的绑定。
+
+    核对分两层，任一不符即拒绝复用（调用方按本次请求重新搜索并覆盖报告
+    与全部产物）：
+
+    1. **结构绑定**（不重算）：``retouch_id`` 与完整请求指纹逐项一致；
+       报告的实际选区 = 请求矩形在当前图像上**按边缘裁剪后**的真实选区；
+       constraints 块与请求约束一致；原任务（job_id/原图哈希/尺寸/模式/
+       意图/阈值）与 ICC 摘要（印刷+显示全 64 位 SHA-256）一致；
+       reachable/偏移/产物字段自洽；
+    2. **内容绑定**（向量化重算，平坦 64×64 选区也在亚秒级）：按当前任务
+       的 ``cmyk.npy`` 与当前印刷 ICC **重新搜索**，得到的可达性、可行偏移
+       数、最优偏移、绝对值和、残余色差必须与报告一致；再按报告/重算结果
+       **重新渲染** before/after PNG 与（可达时）成品 TIFF，与磁盘文件
+       逐字节比较。因此用另一份有效图像/TIFF 替换同名文件、或报告记录的
+       选区/偏移/约束与产物不符，都无法命中复用。
+    """
+    try:
+        if not _check_cached_structure(
+            report, retouch_id, fingerprint, meta, req,
+            press_summary, display_summary,
+        ):
+            return False
+
+        # 内容重算：必须与当前任务分色起点、当前 ICC 上的真实搜索结果相同。
+        result = run_retouch(req, {"meta": meta, "cmyk": cmyk_full}, press_bytes)
+        if result["reachable"] != report["reachable"]:
+            return False
+        if result["best_offset_cmyk"] != report["best_offset_cmyk"]:
+            return False
+        if result["best_abs_shift_sum"] != report["best_abs_shift_sum"]:
+            return False
+        if result["feasible_offset_count"] != \
+                report.get("search", {}).get("feasible_offset_count"):
+            return False
+        if not _reports_equivalent(result["residual"], report.get("residual")):
+            return False
+
+        proof_intent = meta.get("proof_intent", "relative_colorimetric")
+        pngs = render_proof_crops(
+            result, cmyk_full, press_bytes, display_bytes, proof_intent)
+        if (base / "before.png").read_bytes() != pngs["before.png"]:
+            return False
+        if (base / "after.png").read_bytes() != pngs["after.png"]:
+            return False
+
+        tiff_path = base / "retouched.tif"
+        if result["reachable"]:
+            expected_tiff = export_retouched_tiff(
+                result["_cmyk_adjusted"], press_bytes)
+            if not tiff_path.is_file() \
+                    or tiff_path.read_bytes() != expected_tiff:
+                return False
+        elif tiff_path.exists():
+            # 不可达时不得残留成品 TIFF。
+            return False
+    except Exception:
+        # 产物损坏、图像无法解码、色彩转换失败等任何意外：一律视为绑定不符，
+        # 交由调用方重新计算并覆盖（重算路径会给出明确的 422 原因）。
+        return False
+    return True
 
 
 def build_report(retouch_id: str, meta: dict, press_summary: dict,
