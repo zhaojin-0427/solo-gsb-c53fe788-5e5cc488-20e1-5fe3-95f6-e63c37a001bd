@@ -461,3 +461,227 @@ def test_proof_pngs_are_tagged_with_display_profile(client, ids):
     for url in (d["images"]["before"], d["images"]["after"]):
         im = Image.open(io.BytesIO(client.get(url).content))
         assert im.info.get("icc_profile") == display
+
+
+# --------------------------------------------------------------------------
+# 缓存绑定：不仅核对指纹/任务/文件存在，还核对实际选区、约束、原任务、
+# ICC 摘要与预览/成品的**内容**绑定；任一不符即重算并覆盖。
+# --------------------------------------------------------------------------
+
+def _reachable_kw(client, ids, job_id, rect=(4, 4, 16, 16), offset=(3, 0, 0, 0)):
+    target = _mean_lab_of_offset(client, ids, job_id, rect, offset)
+    return dict(x=rect[0], y=rect[1], width=rect[2], height=rect[3],
+                target_lab=[float(v) for v in target], tolerance_de=0.5)
+
+
+def test_region_only_tamper_in_report_triggers_recompute(client, ids):
+    """只改报告 region/constraints 而保留 request 与 retouch_id：拒绝复用。"""
+    from app import main
+    job = _run_job(client, ids, rgb=(180, 180, 180))
+    kw = _reachable_kw(client, ids, job["job_id"])
+    d1 = _retouch(client, job["job_id"], **kw).json()
+    rdir = main.RETOUCH_DIR / d1["retouch_id"]
+    rep = json.loads((rdir / "report.json").read_text("utf-8"))
+    # request 指纹与 retouch_id 保持原样，仅改报告的实际选区/约束。
+    rep["region"] = {"x": 0, "y": 0, "width": 8, "height": 8}
+    rep["constraints"]["total_ink_limit"] = 600
+    (rdir / "report.json").write_text(
+        json.dumps(rep, ensure_ascii=False), "utf-8")
+    d2 = _retouch(client, job["job_id"], **kw).json()
+    assert d2 == d1
+    rep2 = json.loads((rdir / "report.json").read_text("utf-8"))
+    assert rep2["region"] == d1["rect"]
+    assert rep2["constraints"]["total_ink_limit"] == 1020
+
+
+def test_replaced_before_png_content_triggers_recompute(client, ids):
+    """以另一份合法 PNG 替换同名 before.png：内容绑定不符，重算覆盖。"""
+    from app import main
+    job = _run_job(client, ids, rgb=(180, 180, 180))
+    kw = _reachable_kw(client, ids, job["job_id"])
+    d1 = _retouch(client, job["job_id"], **kw).json()
+    rdir = main.RETOUCH_DIR / d1["retouch_id"]
+    before = rdir / "before.png"
+    blob = before.read_bytes()
+    im = np.asarray(Image.open(io.BytesIO(blob))).copy()
+    im[0, 0] = np.clip(im[0, 0].astype(int) + 40, 0, 255).astype(np.uint8)
+    display = client.app.state.state.pm.load_bytes(ids["display"])
+    buf = io.BytesIO()
+    Image.fromarray(im, "RGB").save(buf, format="PNG", icc_profile=display)
+    before.write_bytes(buf.getvalue())
+    try:
+        d2 = _retouch(client, job["job_id"], **kw).json()
+        assert d2 == d1
+        assert before.read_bytes() == blob
+    finally:
+        before.write_bytes(blob)
+
+
+def test_replaced_after_png_content_triggers_recompute(client, ids):
+    from app import main
+    job = _run_job(client, ids, rgb=(180, 180, 180))
+    kw = _reachable_kw(client, ids, job["job_id"], offset=(2, 1, 0, 0))
+    d1 = _retouch(client, job["job_id"], **kw).json()
+    rdir = main.RETOUCH_DIR / d1["retouch_id"]
+    after = rdir / "after.png"
+    blob = after.read_bytes()
+    im = np.asarray(Image.open(io.BytesIO(blob))).copy()
+    im[1, 1] = (0, 255, 0)
+    display = client.app.state.state.pm.load_bytes(ids["display"])
+    buf = io.BytesIO()
+    Image.fromarray(im, "RGB").save(buf, format="PNG", icc_profile=display)
+    after.write_bytes(buf.getvalue())
+    d2 = _retouch(client, job["job_id"], **kw).json()
+    assert d2 == d1
+    assert after.read_bytes() == blob
+
+
+def test_replaced_tiff_content_triggers_recompute(client, ids):
+    """以另一份合法 CMYK TIFF（仍嵌入同一印刷 ICC）替换同名成品：重算覆盖。"""
+    from app import main
+    job = _run_job(client, ids, rgb=(180, 180, 180))
+    kw = _reachable_kw(client, ids, job["job_id"])
+    d1 = _retouch(client, job["job_id"], **kw).json()
+    assert d1["reachable"]
+    tif = main.RETOUCH_DIR / d1["retouch_id"] / "retouched.tif"
+    blob = tif.read_bytes()
+    arr = np.asarray(Image.open(io.BytesIO(blob))).copy()
+    # 选区外像素（0,0）被改动：合法可打开、同 ICC，但绑定不符。
+    v = int(arr[0, 0, 0])
+    arr[0, 0, 0] = v + 7 if v < 240 else v - 7
+    press = client.app.state.state.pm.load_bytes(ids["cmyk"])
+    buf = io.BytesIO()
+    Image.fromarray(arr, "CMYK").save(
+        buf, format="TIFF", compression="raw", icc_profile=press)
+    tif.write_bytes(buf.getvalue())
+    d2 = _retouch(client, job["job_id"], **kw).json()
+    assert d2 == d1
+    assert tif.read_bytes() == blob
+
+
+def test_tampered_press_digest_in_cached_report_triggers_recompute(client, ids):
+    from app import main
+    job = _run_job(client, ids, rgb=(160, 100, 120))
+    kw = _reachable_kw(client, ids, job["job_id"], offset=(1, 1, 0, 0))
+    d1 = _retouch(client, job["job_id"], **kw).json()
+    rdir = main.RETOUCH_DIR / d1["retouch_id"]
+    rep = json.loads((rdir / "report.json").read_text("utf-8"))
+    rep["profiles"]["press"]["sha256"] = "a" * 64
+    (rdir / "report.json").write_text(json.dumps(rep), "utf-8")
+    d2 = _retouch(client, job["job_id"], **kw).json()
+    assert d2 == d1
+    rep2 = json.loads((rdir / "report.json").read_text("utf-8"))
+    assert rep2["profiles"]["press"]["sha256"] == \
+        job["report"]["profiles"]["press"]["sha256"]
+
+
+def test_tampered_source_job_binding_triggers_recompute(client, ids):
+    """报告里原任务的原图哈希/尺寸被改：与当前任务绑定不符，重算覆盖。"""
+    from app import main
+    job = _run_job(client, ids, rgb=(150, 120, 90))
+    kw = _reachable_kw(client, ids, job["job_id"], rect=(10, 10, 12, 12),
+                       offset=(2, -1, 1, 0))
+    d1 = _retouch(client, job["job_id"], **kw).json()
+    rdir = main.RETOUCH_DIR / d1["retouch_id"]
+    rep = json.loads((rdir / "report.json").read_text("utf-8"))
+    rep["source_job"]["image_sha256"] = "9" * 64
+    (rdir / "report.json").write_text(json.dumps(rep), "utf-8")
+    d2 = _retouch(client, job["job_id"], **kw).json()
+    assert d2 == d1
+    rep2 = json.loads((rdir / "report.json").read_text("utf-8"))
+    assert rep2["source_job"]["image_sha256"] == \
+        job["report"]["image"]["sha256"]
+
+
+def test_tampered_offset_and_residual_triggers_recompute(client, ids):
+    """报告偏移/残余色差被改成另一组（文件齐全）：复算不符，重算覆盖。"""
+    from app import main
+    job = _run_job(client, ids, rgb=(180, 180, 180))
+    kw = _reachable_kw(client, ids, job["job_id"])
+    d1 = _retouch(client, job["job_id"], **kw).json()
+    assert d1["best_offset_cmyk"] != [1, 1, 1, 0]
+    rdir = main.RETOUCH_DIR / d1["retouch_id"]
+    rep = json.loads((rdir / "report.json").read_text("utf-8"))
+    rep["best_offset_cmyk"] = [1, 1, 1, 0]
+    rep["best_abs_shift_sum"] = 3
+    rep["residual"]["de00_to_target"] = 0.01
+    (rdir / "report.json").write_text(json.dumps(rep), "utf-8")
+    d2 = _retouch(client, job["job_id"], **kw).json()
+    assert d2 == d1
+    rep2 = json.loads((rdir / "report.json").read_text("utf-8"))
+    assert rep2["best_offset_cmyk"] == d1["best_offset_cmyk"]
+    assert rep2["residual"]["de00_to_target"] == \
+        d1["residual"]["de00_to_target"]
+
+
+def test_edge_clipped_region_binding_uses_actual_selection(client, ids):
+    """贴边的合法裁剪按实际选区核对：48×48 图上 (44,44,16,16) 实际为 4×4。"""
+    from app import main
+    job = _run_job(client, ids, rgb=(160, 100, 120))
+    kw = dict(x=44, y=44, width=16, height=16,
+              target_lab=[50.0, 10.0, -10.0],
+              tolerance_de=50.0, max_shift=2, tac_limit=1020)
+    d1 = _retouch(client, job["job_id"], **kw).json()
+    assert d1["rect"] == {"x": 44, "y": 44, "width": 4, "height": 4}
+    rdir = main.RETOUCH_DIR / d1["retouch_id"]
+    # 报告实际选区/像素数被改成未裁剪值：拒绝复用并恢复为实际裁剪选区。
+    rep = json.loads((rdir / "report.json").read_text("utf-8"))
+    rep["region"] = {"x": 44, "y": 44, "width": 16, "height": 16}
+    rep["pixel_count"] = 256
+    (rdir / "report.json").write_text(json.dumps(rep), "utf-8")
+    d2 = _retouch(client, job["job_id"], **kw).json()
+    assert d2["rect"] == {"x": 44, "y": 44, "width": 4, "height": 4}
+    rep2 = json.loads((rdir / "report.json").read_text("utf-8"))
+    assert rep2["region"] == {"x": 44, "y": 44, "width": 4, "height": 4}
+    assert rep2["pixel_count"] == 16
+    # 预览尺寸即实际裁剪尺寸。
+    im = Image.open(io.BytesIO(client.get(d2["images"]["before"]).content))
+    assert im.size == (4, 4)
+    # 相同请求仍稳定复用（字节级）。
+    assert _retouch(client, job["job_id"], **kw).json() == d2
+
+
+def test_unreachable_stale_tiff_removed_on_reuse(client, ids):
+    """不可达缓存目录里被塞进成品 TIFF：拒绝复用，清除脏成品后复用。"""
+    from app import main
+    job = _run_job(client, ids, rgb=(180, 180, 180))
+    kw = _reachable_kw(client, ids, job["job_id"])
+    reachable = _retouch(client, job["job_id"], **kw).json()
+    tiff_blob = (main.RETOUCH_DIR / reachable["retouch_id"]
+                 / "retouched.tif").read_bytes()
+    body = {
+        "job_id": job["job_id"], "x": 4, "y": 4, "width": 16, "height": 16,
+        "target_lab": [95.0, -40.0, 40.0],
+        "tolerance_de": 0.0, "max_shift": 0, "tac_limit": 1020,
+    }
+    du = client.post("/api/retouch", json=body).json()
+    assert du["reachable"] is False
+    udir = main.RETOUCH_DIR / du["retouch_id"]
+    assert not (udir / "retouched.tif").exists()
+    (udir / "retouched.tif").write_bytes(tiff_blob)
+    du2 = client.post("/api/retouch", json=body).json()
+    assert du2 == du
+    assert not (udir / "retouched.tif").exists()
+    assert client.get(f"/api/retouch/{du['retouch_id']}/retouched.tif"
+                      ).status_code == 422
+
+
+def test_corrupt_report_json_triggers_recompute(client, ids):
+    from app import main
+    job = _run_job(client, ids)
+    d1 = _retouch(client, job["job_id"]).json()
+    rp = main.RETOUCH_DIR / d1["retouch_id"] / "report.json"
+    rp.write_text("{not json", "utf-8")
+    d2 = _retouch(client, job["job_id"]).json()
+    assert d2 == d1
+    assert json.loads(rp.read_text("utf-8"))["retouch_id"] == d1["retouch_id"]
+
+
+def test_identical_request_after_verification_remains_stable(client, ids):
+    """经过强化核对后，相同请求连续提交仍稳定复用同一结果。"""
+    job = _run_job(client, ids, rgb=(170, 120, 90))
+    kw = _reachable_kw(client, ids, job["job_id"], rect=(10, 10, 12, 12),
+                       offset=(2, -1, 1, 0))
+    d1 = _retouch(client, job["job_id"], **kw).json()
+    for _ in range(3):
+        assert _retouch(client, job["job_id"], **kw).json() == d1

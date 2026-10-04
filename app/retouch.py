@@ -221,22 +221,75 @@ def _mean_lab_for_offset(
     return (unique_lab * weights).sum(axis=0)
 
 
+def clip_region(cmyk_full: np.ndarray, req: RetouchRequest) -> tuple[int, int, int, int]:
+    """按原任务实际尺寸裁剪选区，返回 ``(x, y, clipped_width, clipped_height)``。
+
+    选区起点越界非法；宽高超出图像边缘时按实际交点裁剪（例如选区贴住右/下
+    边）——缓存核对必须以**裁剪后的实际选区**为准，而不是请求字面值。
+    """
+    h, w = cmyk_full.shape[:2]
+    if req.x >= w or req.y >= h:
+        raise RetouchError("选区起点超出原任务图像范围")
+    x2, y2 = min(w, req.x + req.width), min(h, req.y + req.height)
+    return req.x, req.y, x2 - req.x, y2 - req.y
+
+
+def compute_residual_stats(lab_xf, roi_before: np.ndarray, roi_after: np.ndarray,
+                           target: np.ndarray, best_mean_lab, best_de,
+                           de_before_target: float, reachable: bool,
+                           rect_hw: tuple[int, int]) -> dict:
+    """构造报告中的残余色差字典。
+
+    搜索与缓存校验共用同一份实现，保证缓存命中时按当前 CMYK/ICC 复算出的
+    数值与报告逐键一致；不可达时修色后相关字段一律为 ``None``。
+    ``lab_xf`` 为已打开的 ``CMYK -> Lab_DBL`` 变换。
+    """
+    rh, rw = rect_hw
+    flat_before = np.ascontiguousarray(roi_before).reshape(-1, 4)
+    lab_before = lab_xf(flat_before)
+    mean_lab_before = lab_before.mean(axis=0)
+    common = {
+        "mean_lab_before": [round(float(v), 4) for v in mean_lab_before],
+        "target_lab": [round(float(v), 4) for v in target],
+        "de00_before_to_target": round(float(de_before_target), 4),
+    }
+    if not reachable:
+        return {
+            "mean_de00_before_after": None,
+            "max_de00_before_after": None,
+            "mean_lab_after": None,
+            "de00_to_target": (round(float(best_de), 4)
+                               if best_de is not None else None),
+            **common,
+        }
+    lab_after = lab_xf(np.ascontiguousarray(roi_after).reshape(-1, 4))
+    de_residual = colorscience.ciede2000(
+        lab_before.reshape(rh, rw, 3),
+        lab_after.reshape(rh, rw, 3),
+    )
+    return {
+        "mean_de00_before_after": round(float(de_residual.mean()), 4),
+        "max_de00_before_after": round(float(de_residual.max()), 4),
+        "mean_lab_after": [round(float(v), 4) for v in best_mean_lab],
+        "de00_to_target": round(float(best_de), 4),
+        **common,
+    }
+
+
 def run_retouch(req: RetouchRequest, ctx: dict, press_bytes: bytes) -> dict:
     """执行搜索并返回可直接落盘/展示的修色结果字典。"""
     meta = ctx["meta"]
     cmyk_full = ctx["cmyk"]
-    H, W = cmyk_full.shape[:2]
-    if req.x >= W or req.y >= H:
-        raise RetouchError("选区起点超出原任务图像范围")
-    x2, y2 = min(W, req.x + req.width), min(H, req.y + req.height)
-    rw, rh = x2 - req.x, y2 - req.y
-
-    roi = cmyk_full[req.y:y2, req.x:x2]
-    flat = np.ascontiguousarray(roi).reshape(-1, 4)
 
     intent = meta.get("source_intent", "relative_colorimetric")
     if intent not in lcms_native.INTENTS:
         raise RetouchError(f"原任务渲染意图无效: {intent}")
+
+    x, y, rw, rh = clip_region(cmyk_full, req)
+    x2, y2 = x + rw, y + rh
+
+    roi = cmyk_full[y:y2, x:x2]
+    flat = np.ascontiguousarray(roi).reshape(-1, 4)
 
     candidates = _feasible_offsets(roi, req.max_shift, req.tac_limit)
     target = np.array(req.target_lab, dtype=np.float64)
@@ -292,37 +345,22 @@ def run_retouch(req: RetouchRequest, ctx: dict, press_bytes: bytes) -> dict:
         roi_adj = np.clip(
             roi.astype(np.int32) + np.array(offset, dtype=np.int32), 0, 255
         ).astype(np.uint8)
-        adjusted_full[req.y:y2, req.x:x2] = roi_adj
+        adjusted_full[y:y2, x:x2] = roi_adj
 
-        if reachable:
-            roi_lab_after = lab_xf(np.ascontiguousarray(roi_adj.reshape(-1, 4)))
-            de_residual = colorscience.ciede2000(
-                roi_lab_before.reshape(rh, rw, 3),
-                roi_lab_after.reshape(rh, rw, 3),
-            )
-            residual_stats = {
-                "mean_de00_before_after": round(float(de_residual.mean()), 4),
-                "max_de00_before_after": round(float(de_residual.max()), 4),
-                "mean_lab_before": [round(float(v), 4) for v in baseline_mean_lab],
-                "mean_lab_after": [round(float(v), 4) for v in best_mean_lab],
-                "target_lab": [round(float(v), 4) for v in target],
-                "de00_to_target": round(float(best_de), 4),
-                "de00_before_to_target": round(float(de_before_target), 4),
-            }
-        else:
-            residual_stats = {
-                "mean_de00_before_after": None,
-                "max_de00_before_after": None,
-                "mean_lab_before": [round(float(v), 4) for v in baseline_mean_lab],
-                "mean_lab_after": None,
-                "target_lab": [round(float(v), 4) for v in target],
-                "de00_to_target": (round(float(best_de), 4)
-                                   if best_de is not None else None),
-                "de00_before_to_target": round(float(de_before_target), 4),
-            }
+        residual_stats = compute_residual_stats(
+            lab_xf=lab_xf,
+            roi_before=roi,
+            roi_after=roi_adj,
+            target=target,
+            best_mean_lab=best_mean_lab if reachable else None,
+            best_de=best_de,
+            de_before_target=de_before_target,
+            reachable=reachable,
+            rect_hw=(rh, rw),
+        )
 
     return {
-        "rect": {"x": int(req.x), "y": int(req.y),
+        "rect": {"x": int(x), "y": int(y),
                  "width": int(rw), "height": int(rh)},
         "pixel_count": int(rw * rh),
         "constraints": {
@@ -348,28 +386,46 @@ def run_retouch(req: RetouchRequest, ctx: dict, press_bytes: bytes) -> dict:
 # 软打样可视化（选区修色前/后）与成品 TIFF
 # ---------------------------------------------------------------------------
 
+def render_proof_pngs(roi_before: np.ndarray, roi_after: np.ndarray,
+                      rect_hw: tuple[int, int], press_bytes: bytes,
+                      display_bytes: bytes, intent: str,
+                      proof_intent: str) -> dict[str, bytes]:
+    """给定选区划 CMYK（修色前/后）生成嵌入显示 ICC 的软打样 PNG。
+
+    搜索落盘与缓存内容核对共用同一渲染，字节完全确定，因此可以直接做
+    字节相等比较。
+    """
+    rh, rw = rect_hw
+    before = np.ascontiguousarray(roi_before).reshape(-1, 4)
+    after = np.ascontiguousarray(roi_after).reshape(-1, 4)
+
+    with lcms_native.lab_transform("CMYK", press_bytes, intent) as lab_xf:
+        lab_before = lab_xf(before)
+        lab_after = lab_xf(after)
+
+    def to_png(lab: np.ndarray) -> bytes:
+        rgb = lcms_native.lab_to_pixels(lab, display_bytes, "RGB", proof_intent)
+        img = Image.fromarray(rgb.reshape(rh, rw, 3), "RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", icc_profile=display_bytes)
+        return buf.getvalue()
+
+    return {"before.png": to_png(lab_before), "after.png": to_png(lab_after)}
+
+
 def render_proof_crops(result: dict, cmyk_full: np.ndarray,
                        press_bytes: bytes, display_bytes: bytes,
                        proof_intent: str) -> dict[str, bytes]:
     """生成修色前/后选区软打样 PNG（嵌入显示 ICC）。"""
     rect = result["rect"]
     x, y, w, h = rect["x"], rect["y"], rect["width"], rect["height"]
-    before = np.ascontiguousarray(cmyk_full[y:y + h, x:x + w].reshape(-1, 4))
-    after = np.ascontiguousarray(result["_roi_after"].reshape(-1, 4))
-
-    with lcms_native.lab_transform("CMYK", press_bytes,
-                                   result["_intent"]) as lab_xf:
-        lab_before = lab_xf(before)
-        lab_after = lab_xf(after)
-
-    def to_png(lab: np.ndarray) -> bytes:
-        rgb = lcms_native.lab_to_pixels(lab, display_bytes, "RGB", proof_intent)
-        img = Image.fromarray(rgb.reshape(h, w, 3), "RGB")
-        buf = io.BytesIO()
-        img.save(buf, format="PNG", icc_profile=display_bytes)
-        return buf.getvalue()
-
-    return {"before.png": to_png(lab_before), "after.png": to_png(lab_after)}
+    return render_proof_pngs(
+        cmyk_full[y:y + h, x:x + w],
+        result["_roi_after"],
+        (h, w),
+        press_bytes, display_bytes,
+        result["_intent"], proof_intent,
+    )
 
 
 def export_retouched_tiff(cmyk_adjusted: np.ndarray, press_bytes: bytes) -> bytes:
@@ -426,35 +482,312 @@ def compute_retouch_id(meta: dict, req: RetouchRequest) -> str:
     ).hexdigest()
 
 
-def cache_entry_valid(report: object, retouch_id: str, fingerprint: dict,
-                      base: Path) -> bool:
-    """命中缓存时核对报告与产物确实绑定本次任务、矩形及约束。
+def _same_lab_list(a, b, tol: float = 1e-4) -> bool:
+    """两个报告中的 Lab/数值列表逐项比较（报告值 round 到 4 位）。"""
+    if not (isinstance(a, list) and isinstance(b, list) and len(a) == len(b)):
+        return False
+    return all(isinstance(x, (int, float)) and isinstance(y, (int, float))
+               and abs(float(x) - float(y)) <= 1e-9 + tol
+               for x, y in zip(a, b))
 
-    任一不符即拒绝复用（调用方按本次请求重新计算并覆盖）：
 
-    * 报告须记录同一 ``retouch_id`` 与**完全一致的请求指纹**（任务、选区
-      矩形、目标 Lab、容差、偏移/总墨量约束逐项相等）；
-    * 报告须绑定同一原任务；
-    * 修色前/后预览 PNG 必须都在；
-    * 可达时成品 TIFF 必须在；不可达时不得残留成品 TIFF。
+def _expected_constraints(req: RetouchRequest) -> dict:
+    return {
+        "target_lab": [float(v) for v in req.target_lab],
+        "tolerance_de00": float(req.tolerance_de),
+        "max_shift_per_channel": int(req.max_shift),
+        "total_ink_limit": int(req.tac_limit),
+    }
+
+
+def _expected_source_job(meta: dict) -> dict:
+    return {
+        "job_id": meta["job_id"],
+        "image_sha256": meta.get("image_sha256"),
+        "width": meta.get("width"),
+        "height": meta.get("height"),
+        "image_mode": meta.get("mode"),
+        "source_intent": meta.get("source_intent"),
+        "proof_intent": meta.get("proof_intent"),
+        "threshold_delta_e": meta.get("threshold"),
+    }
+
+
+def _offset_is_feasible(roi: np.ndarray, offset, max_shift: int,
+                        tac_limit: int) -> bool:
+    """统一偏移对选区**每个像素**满足字节范围 / 单通道上限 / 总墨量上限。"""
+    off = np.asarray(offset, dtype=np.int32)
+    if off.shape != (4,):
+        return False
+    if np.abs(off).max() > max_shift:
+        return False
+    shifted = roi.reshape(-1, 4).astype(np.int32) + off[None, :]
+    if shifted.min() < 0 or shifted.max() > 255:
+        return False
+    return bool(shifted.sum(axis=1).max() <= tac_limit)
+
+
+# 缓存命中时全量复算选优的候选上限；超过则“3^4 邻域 + 等距抽样”核对。
+# 阈值取 4000：真实选区内墨色高度相关，lab 缓存命中率高、代价毫秒级；
+# 只有“随机噪点级选区 + max_shift=8”这类病态输入会产生上万组低重叠候选，
+# 其首次搜索本身就慢——缓存命中时抽样核对避免重复支付全量代价。
+_FULL_CHECK_CANDIDATES = 4000
+# 超大候选空间下的抽样规模。
+_SAMPLE_CANDIDATES = 2000
+
+
+def verify_cache(report: object, retouch_id: str, fingerprint: dict,
+                 base: Path, ctx: dict, req: RetouchRequest,
+                 press_bytes: bytes, display_bytes: bytes) -> bool:
+    """逐项核对缓存报告/预览/成品与**本次请求**的实际绑定。
+
+    不仅核对指纹、任务 ID 与文件存在，还核对：
+
+    * 报告记录的实际选区 == 请求矩形按原任务尺寸**裁剪后**的选区
+      （贴边的合法裁剪按实际交点核对）、约束 == 请求约束；
+    * 报告绑定的原任务（原图哈希、尺寸、模式、双意图、阈值）与当前
+      ``meta`` 一致，印刷/显示 ICC 的 SHA-256 摘要与当前字节一致；
+    * before/after 预览 PNG 字节 == 按当前分色、报告偏移与当前 ICC
+      **重新渲染**的结果（尺寸/嵌入显示 ICC/像素内容一并绑定）；
+    * 可行偏移数量独立重算；报告偏移逐像素满足通道/总墨量约束，候选数在
+      阈值内时全量、否则以 3^4 邻域 + 等距抽样复算选优，均不得优于报告
+      偏移；残余色差按当前分色与印刷 ICC 复算一致；
+    * 成品 TIFF 解码后逐像素核对（选区外逐字节相同、选区内恰为该统一
+      偏移）并核对嵌入的印刷 ICC；可达时必须存在，不可达时不得残留。
+
+    任一项不符返回 ``False``，调用方按本次请求重新搜索并覆盖全部产物。
     """
-    if not isinstance(report, dict):
+    try:
+        if not isinstance(report, dict):
+            return False
+        if report.get("retouch_id") != retouch_id:
+            return False
+        if report.get("request") != fingerprint:
+            return False
+
+        meta = ctx["meta"]
+        cmyk_full = ctx["cmyk"]
+        x, y, rw, rh = clip_region(cmyk_full, req)
+        x2, y2 = x + rw, y + rh
+
+        # ---- 报告语义字段：实际选区 / 像素数 / 约束 --------------------
+        if report.get("region") != {
+                "x": int(x), "y": int(y),
+                "width": int(rw), "height": int(rh)}:
+            return False
+        if report.get("pixel_count") != int(rw * rh):
+            return False
+        constraints = report.get("constraints")
+        expected_constraints = _expected_constraints(req)
+        if not isinstance(constraints, dict):
+            return False
+        if set(constraints) != set(expected_constraints):
+            return False
+        for k, v in expected_constraints.items():
+            cv = constraints[k]
+            if isinstance(v, list):
+                if not _same_lab_list(cv, v, tol=0.0):
+                    return False
+            elif cv != v:
+                return False
+
+        # ---- 原任务绑定 ------------------------------------------------
+        if report.get("source_job") != _expected_source_job(meta):
+            return False
+
+        # ---- ICC 摘要绑定 ----------------------------------------------
+        profiles = report.get("profiles")
+        if not isinstance(profiles, dict):
+            return False
+        press_summary = profiles.get("press")
+        display_summary = profiles.get("display")
+        if not isinstance(press_summary, dict) or \
+                not isinstance(display_summary, dict):
+            return False
+        if press_summary.get("sha256") != hashlib.sha256(press_bytes).hexdigest():
+            return False
+        if display_summary.get("sha256") != hashlib.sha256(display_bytes).hexdigest():
+            return False
+        if press_summary.get("color_space") != "CMYK":
+            return False
+
+        # ---- 可达性与文件存在性一致 ------------------------------------
+        reachable = report.get("reachable")
+        if reachable not in (True, False):
+            return False
+        tiff_path = base / "retouched.tif"
+        if reachable is True and not tiff_path.is_file():
+            return False
+        if reachable is False and tiff_path.exists():
+            return False
+        before_path, after_path = base / "before.png", base / "after.png"
+        if not before_path.is_file() or not after_path.is_file():
+            return False
+
+        # ---- 报告偏移 / 搜索计数 / 选优 --------------------------------
+        offset_raw = report.get("best_offset_cmyk")
+        if not (isinstance(offset_raw, list) and len(offset_raw) == 4
+                and all(isinstance(v, int) and not isinstance(v, bool)
+                        for v in offset_raw)):
+            return False
+        offset = np.asarray(offset_raw, dtype=np.int32)
+        abs_sum = int(np.abs(offset).sum())
+
+        roi = cmyk_full[y:y2, x:x2]
+        candidates = _feasible_offsets(roi, req.max_shift, req.tac_limit)
+        search = report.get("search")
+        if not isinstance(search, dict) or \
+                search.get("feasible_offset_count") != int(candidates.shape[0]):
+            return False
+        if reachable and not _offset_is_feasible(
+                roi, offset, req.max_shift, req.tac_limit):
+            return False
+        if candidates.shape[0] == 0:
+            # 无可行偏移：报告偏移必须是零偏移（实现以零偏移构造“修色后”）。
+            if offset_raw != [0, 0, 0, 0]:
+                return False
+            if report.get("best_abs_shift_sum") not in (None, 0):
+                return False
+        else:
+            if not _offset_is_feasible(roi, offset, req.max_shift,
+                                       req.tac_limit):
+                return False
+            if report.get("best_abs_shift_sum") != abs_sum:
+                return False
+
+        roi_after = np.clip(
+            roi.astype(np.int32) + offset[None, None, :], 0, 255
+        ).astype(np.uint8)
+        target = np.array(req.target_lab, dtype=np.float64)
+        intent = meta.get("source_intent", "relative_colorimetric")
+
+        with lcms_native.lab_transform("CMYK", press_bytes, intent) as lab_xf:
+            flat = np.ascontiguousarray(roi).reshape(-1, 4)
+            lab_before = lab_xf(flat)
+            mean_before = lab_before.mean(axis=0)
+            de_before_target = float(colorscience.ciede2000(
+                target[None, None, :], mean_before[None, None, :])[0, 0])
+            mean_after = lab_xf(
+                np.ascontiguousarray(roi_after).reshape(-1, 4)
+            ).mean(axis=0)
+            de_after_target = float(colorscience.ciede2000(
+                target[None, None, :], mean_after[None, None, :])[0, 0])
+
+            # 可达性必须与“报告偏移的实际 ΔE00 对容差”相符。
+            if reachable != (de_after_target <= float(req.tolerance_de) + 1e-9):
+                return False
+
+            # 抽样/全量复算选优：不得有候选按 (ΔE00, 绝对值和, 字典序)
+            # 严格优于报告偏移（与 run_retouch 完全相同的三级选优规则）。
+            if candidates.shape[0]:
+                if candidates.shape[0] <= _FULL_CHECK_CANDIDATES:
+                    sample = candidates
+                else:
+                    # 超大候选空间：报告偏移的 3^4 邻域 + 等距抽样。
+                    claimed_t = tuple(int(v) for v in offset)
+                    near = np.all(
+                        np.abs(candidates.astype(np.int32)
+                               - np.asarray(claimed_t, dtype=np.int32)) <= 1,
+                        axis=1,
+                    )
+                    step = max(1, candidates.shape[0] // _SAMPLE_CANDIDATES)
+                    sample = np.unique(np.concatenate(
+                        [candidates[near],
+                         candidates[::step][:_SAMPLE_CANDIDATES]], axis=0
+                    ), axis=0)
+                lab_cache: dict[int, np.ndarray] = {}
+                decorated = []
+                for off in sample:
+                    mean_lab = _mean_lab_for_offset(flat, off, lab_xf, lab_cache)
+                    de_off = float(colorscience.ciede2000(
+                        target[None, None, :], mean_lab[None, None, :])[0, 0])
+                    decorated.append(
+                        (de_off, int(np.abs(off.astype(np.int32)).sum()),
+                         tuple(int(v) for v in off)))
+                decorated.sort(key=lambda t: (t[0], t[1], t[2]))
+                # 报告偏移的 ΔE00 在同一 transform 下按相同输入重算，与候选
+                # 评估完全一致（同一 mean-Lab、同一 ΔE 公式），浮点结果按位
+                # 相同，因此直接用三级键比较即可，无需容差。
+                claimed_key = (de_after_target, abs_sum,
+                               tuple(int(v) for v in offset))
+                if decorated[0] < claimed_key:
+                    return False
+
+            # ---- 残余色差按当前分色 / ICC 复算一致 --------------------
+            expected_residual = compute_residual_stats(
+                lab_xf=lab_xf,
+                roi_before=roi,
+                roi_after=roi_after,
+                target=target,
+                best_mean_lab=mean_after if reachable else None,
+                best_de=de_after_target if candidates.shape[0] else None,
+                de_before_target=de_before_target,
+                reachable=reachable,
+                rect_hw=(rh, rw),
+            )
+        residual = report.get("residual")
+        if not isinstance(residual, dict) or \
+                set(residual) != set(expected_residual):
+            return False
+        for k, ev in expected_residual.items():
+            rv = residual[k]
+            if ev is None:
+                if rv is not None:
+                    return False
+            elif isinstance(ev, list):
+                if not _same_lab_list(rv, ev, tol=5e-5):
+                    return False
+            elif isinstance(ev, (int, float)):
+                if not isinstance(rv, (int, float)) or abs(rv - ev) > 5e-5:
+                    return False
+            elif rv != ev:
+                return False
+
+        # ---- 预览 PNG：按当前数据/ICC 重渲染，字节必须一致 -------------
+        proof_intent = meta.get("proof_intent", "relative_colorimetric")
+        expected_pngs = render_proof_pngs(
+            roi, roi_after, (rh, rw),
+            press_bytes, display_bytes, intent, proof_intent,
+        )
+        if before_path.read_bytes() != expected_pngs["before.png"]:
+            return False
+        if after_path.read_bytes() != expected_pngs["after.png"]:
+            return False
+
+        # ---- 成品 TIFF：解码后逐像素核对（选区外逐字节相同、选区内恰为
+        # 该统一偏移）并核对嵌入的印刷 ICC；不重新编码整幅 TIFF。 -------
+        artifacts = report.get("artifacts")
+        if not isinstance(artifacts, dict):
+            return False
+        if reachable:
+            adjusted_full = cmyk_full.copy()
+            adjusted_full[y:y2, x:x2] = roi_after
+            try:
+                with Image.open(tiff_path) as im:
+                    im.load()
+                    if im.mode != "CMYK" or im.size != (
+                            int(cmyk_full.shape[1]), int(cmyk_full.shape[0])):
+                        return False
+                    if im.info.get("icc_profile") != press_bytes:
+                        return False
+                    tiff_cmyk = np.asarray(im)
+            except Exception:
+                return False
+            if tiff_cmyk.shape != adjusted_full.shape or \
+                    not np.array_equal(tiff_cmyk, adjusted_full):
+                return False
+            if artifacts.get("tiff") != "retouched.tif":
+                return False
+        elif artifacts.get("tiff") is not None:
+            return False
+        if artifacts.get("before_png") != "before.png" or \
+                artifacts.get("after_png") != "after.png":
+            return False
+
+        return True
+    except (OSError, ValueError, KeyError, TypeError):
+        # 缓存文件损坏 / 报告结构异常：一律拒绝复用。
         return False
-    if report.get("retouch_id") != retouch_id:
-        return False
-    if report.get("request") != fingerprint:
-        return False
-    source_job = report.get("source_job")
-    if not isinstance(source_job, dict) or \
-            source_job.get("job_id") != fingerprint["job_id"]:
-        return False
-    if not (base / "before.png").is_file() or \
-            not (base / "after.png").is_file():
-        return False
-    tiff = base / "retouched.tif"
-    if report.get("reachable") is True:
-        return tiff.is_file()
-    return not tiff.exists()
 
 
 def build_report(retouch_id: str, meta: dict, press_summary: dict,
